@@ -1,0 +1,1010 @@
+---
+title: 'DS740, Final Project: SleepQuality analysis from Garmin and LoseIt data'
+author: "John Woodward"
+date: ' `r Sys.Date()`'
+output:
+  word_document:
+    reference_docx: Word_template.docx
+    fig_height: 5
+    fig_width: 6
+  tables:
+    style: MyTable
+#always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, message=FALSE, echo=FALSE}
+library(readr)
+library(readxl)
+library(lubridate) # working with date-time data
+library(dplyr)
+library(tidyr) # data cleanup
+library(moments) # skewness for transform
+library(DMwR2) # imputing numerical
+library(imputeTS) # imputing
+library(imputeMissings)
+source("my_functions.R") # gf_partialPlot and other functions
+library(zoo) # rollmean for Moving Averages
+
+# plotting
+library(RColorBrewer) # colors for correlation plot
+library(ggformula)
+library(knitr) # making format look cooler
+library(gridExtra)
+
+library(patchwork) # making cooler layouts
+library(cowplot)
+library(arules) # association rules
+
+library(caret) # cross validating
+library(rpart)
+library(rpart.plot)
+library(xgboost) # fitting to full data/ var Importance
+
+
+num_figure <- 0 ; num_table <- 0 # initialize counters
+```
+
+# Introduction
+Imagine feeling refreshed every morning—awakening energized, mentally resilient, and physically revitalized each morning. This machine learning analysis (e.g., Decision Trees, Gradient Boosting) of my two-year biometric data delves into what distinguishes great, OK, and poor sleep, which may guide more informed lifestyle improvements.
+
+Moreover, this exploration is a gold mine for Garmin, offering valuable insights into sleep. For example, imagine: what if there was a successful `SleepQuality` classification? What if Garmin added it to their software as an automatic `SleepQuality` metric? Wouldn't Garmin boost their sleep tracking device's value and improve users' health and happiness? It would be a chance for Garmin to gain a decisive competitive edge in the sleep-tracking market.
+
+# Data Preparation
+## Data Organization
+
+My project's dataset includes several tables:
+
+1. `food` - a transactional, many-per-day export from LoseIt.com with food details.
+2. `exercise` - a transactional, many-per-day export from LoseIt.com containing exercise information.
+3. `agg` - a daily CSV from LoseIt.com with biometric data.
+4. `sleep` - a daily CSV from Python combining sleep data from Garmin and Apple sources.
+
+The primary table is `sleep`, supplemented by `agg` variables, and later, `food` and `exercise` will aggregate to predict `SleepQuality.`
+
+## Data Extraction, Loading, and Transforming (ETL)
+I began by preparing the food and exercise datasets, refining them, and importing their CSV files. Then, I enriched the data with aggregated information from LoseIt.com, further refining and importing the CSV. Enhancements included: converting datatypes, rolling averages, statistical smoothing, handling missing data, addressing outliers, and introducing relevant time lags.
+
+```{r, message=FALSE, warning=FALSE}
+food_raw <- read_csv("food-logs_edit.csv", show_col_types = FALSE)
+food <- food_raw %>% # Process food data
+  mutate(Date = as.Date(mdy(Date))) %>% # Convert Date format
+  mutate(across(where(is.character), ~na_if(., "n/a"))) # Replace "n/a" with NA
+
+start_col <- which(colnames(food) == "Saturated Fat (g)") # Find column indices to remove
+end_col <- which(colnames(food) == "Sodium (mg)")
+food <- food %>% # Remove columns based on index range
+  dplyr::select(-all_of(start_col:end_col)) 
+
+exercise_raw <- read_csv("exercise-logs_edit.csv", show_col_types = FALSE)
+exercise <- exercise_raw %>% # Process exercise data
+  mutate(Date = as.Date(mdy(Date))) %>% # Convert Date format
+  dplyr::select(-c(Calories, Units)) %>% # Remove Calories (Half are NA), Units are all minutes
+  group_by(Date, Icon) %>%
+  summarize(Total_Minutes = sum(Quantity, na.rm = TRUE)) # Calculate total minutes
+```
+
+```{r}
+############### Read aggregated data
+agg_raw <- read_csv("aggData_edit.csv", show_col_types = FALSE)
+agg <- agg_raw %>%
+  mutate(Date = as.Date(mdy(Date))) %>% # Convert Date
+  mutate( # smoothing out the noisy and missingness
+    Weight_MA14 = round(rollmean(Weight, k = 14, fill = NA, na.rm = TRUE, align = "center"),1),
+    BodyFatPercent_MA45 = round(rollmean(BodyFatPercent, k = 45, fill = NA, na.rm = TRUE, align = "center"),1)
+  ) # also rounding to 1-decimal because any more sig figs exceeds measuring accuracy
+
+# minHeartRate NEEDS garmin sleep data paired with it else it is not a good data point
+agg <-
+  replace_outliers_with_na(agg,
+                           "maxHeartRate",
+                           multiplier = 0.5,
+                           # Domain knowledge: cutting within IQR because maxHeartRate should be *at least* 90-100 if I am moving out and about, even sedentary days
+                           ignore_upper = TRUE) # high heartrate outliers can be true (high-intensity exercise)
+
+Figure1_p4 <- plot_missing_data_heatmap(agg)
+
+agg <- agg %>% 
+  mutate( # lagged 1day with Sleep as lowest with sleep (1-4am) and I tend to sleep by or after midnight
+    minHeartRate = lag(minHeartRate)) %>%
+  fill(Weight_MA14,
+       BodyFatPercent_MA45,
+       .direction = "updown") %>% # up then down because Moving Average
+  dplyr::select(-c(Weight,BodyFatPercent))
+
+Figure1_p5 <- plot_missing_data_heatmap(agg)
+
+```
+Finally, I focused on the primary 'sleep' dataset. I used Python to collect and merge daily sleep data from Garmin (e.g., JSON) and Apple (e.g., XML) health data exports. I meticulously handled the information to create a well-organized and structured dataset.
+
+```{r, warning=FALSE}
+############### Read Sleep data
+sleep_raw <- read_xlsx("sleepData_edit.xlsx")
+sleep <- sleep_raw %>%
+  mutate(Date = as.Date(Date)) %>% arrange(Date) %>% # date handling 
+  mutate(across(where(is.character), na_if, "N/A")) %>% #replace "N/A" with NA
+  mutate(across(contains("SleepSeconds"), as.numeric)) 
+
+sleep_raw2 <- read_csv("sleep_iPhoneHealth_edit.csv", show_col_types = FALSE)
+sleep_supplement <- sleep_raw2 %>%
+  mutate(
+    across(c(SleepStartTimestamp, SleepEndTimestamp), mdy_hm),
+    BedStartTimestamp = SleepStartTimestamp,
+    BedEndTimestamp = SleepEndTimestamp,
+    Date = mdy(Date)
+  ) %>%  dplyr::select(-c(SleepStartTimestamp, SleepEndTimestamp))
+
+# Left join sleep with sleep_supplement using "Date" as the key
+sleep <- left_join(sleep, sleep_supplement, by = "Date")
+
+sleep <- sleep %>% # Rename columns ending in "SleepSeconds" to "SleepMinutes"
+  rename_with( ~ sub('Seconds$', 'Minutes', .), ends_with("SleepSeconds")) %>%
+  mutate(across(ends_with("SleepMinutes"), ~ as.numeric(.) * 0.017)) # dividing by 60 loses the decimal
+
+sleep <- sleep %>% # reorder columns
+  select(Date, TimeZone,Type, SourceName, BedStartTimestamp, sleepStartTimestampCST, sleepEndTimestampCST,BedEndTimestamp,everything())
+
+sleep <- sleep %>% # Turn "Sleep" time stamps to NA if Type is "OFF_WRIST" or "UNCONFIRMED" or "JRW_ENTERED"
+  mutate(across(c(sleepStartTimestampCST, sleepEndTimestampCST), ~ case_when(
+    Type %in% c("OFF_WRIST", "UNCONFIRMED","JRW_ENTERED") ~ as.POSIXct(NA),
+    TRUE ~ .
+  ))) %>% # create a missingness boolean for later cluster weighting 
+  mutate(Missing_sleepquality = if_any(c(remSleepMinutes, deepSleepMinutes), is.na))
+
+# Change to hours from Datetime
+sleep <- sleep %>%
+  rename(
+    BedStart_Hours = BedStartTimestamp,
+    BedEnd_Hours = BedEndTimestamp,
+    sleepStart_Hours = sleepStartTimestampCST,
+    sleepEnd_Hours = sleepEndTimestampCST
+  ) %>% # use pmin/pmax to ensure bedtimes aren't between sleeptimes
+  mutate(
+    BedStart_Hours = pmin(BedStart_Hours, sleepStart_Hours, na.rm = TRUE),
+    BedEnd_Hours = pmax(BedEnd_Hours, sleepEnd_Hours, na.rm = TRUE),
+    BedStart_Hours = posix_to_hours_after_midnight(BedStart_Hours),
+    BedEnd_Hours = posix_to_hours_after_midnight(BedEnd_Hours),
+    sleepStart_Hours = posix_to_hours_after_midnight(sleepStart_Hours),
+    sleepEnd_Hours = posix_to_hours_after_midnight(sleepEnd_Hours)
+  ) %>% 
+  dplyr::select(-c(`Notes`,`SleepCycleDisruptions`))
+
+#convert all chr to factors
+sleep <- sleep %>%
+  mutate_if(is.character, as.factor)
+
+Figure1_p1 <- plot_missing_data_heatmap(sleep)
+```
+
+## Exploratory Data Analysis on `SleepQuality` via Clustering
+For strategically assessing `SleepQuality`, I wanted a simplified interpretation of this response. After exploring references, comparing recent sleep experiences to measurements, and data trial and error, my focus narrowed to two key sleep measures: `deepSleepMinutes` and `remSleepMinutes`. However, the data revealed a bias within my sleep: a lack of low remSleepMinutes.
+
+```{r}
+augmenting_duplicates = 20   # Set augmenting variables
+perturbation_standarddeviation = 7
+
+set.seed(777)  # Set random seed
+
+sleepquality_clustering <- sleep %>%
+  filter(!Missing_sleepquality) %>%  # Filter for real, non-imputed sleep quality
+  dplyr::select(c(Date, remSleepMinutes, deepSleepMinutes, awakeSleepMinutes))
+
+# Augment VERY POOR sleep
+sleep_augment_VERYPOOR <- sleep %>% # filters for specific data point, perturbs
+  filter(!Missing_sleepquality & remSleepMinutes == 0 & deepSleepMinutes == 0) %>% dplyr::select(c(remSleepMinutes, deepSleepMinutes, awakeSleepMinutes))
+sleep_augment_VERYPOOR <- augment_data(sleep_augment_VERYPOOR, duplicates = augmenting_duplicates, perturb_mean = 15, perturb_sd = perturbation_standarddeviation)
+
+# Augment POOR REM sleep
+sleep_augment_POORrem <- sleep %>% # filters for specific data point, perturbs
+  filter(!Missing_sleepquality & remSleepMinutes < 45 & deepSleepMinutes > 100) %>% dplyr::select(c(remSleepMinutes, deepSleepMinutes, awakeSleepMinutes))
+sleep_augment_POORrem <- augment_data(sleep_augment_POORrem, duplicates = augmenting_duplicates, perturb_sd = perturbation_standarddeviation)
+
+# Augment Poor-ish sleep
+sleep_augment_OK <- sleep %>% # filters for specific data point, perturbs
+  filter(!Missing_sleepquality & between(remSleepMinutes, 45, 50) & between(deepSleepMinutes, 50, 75)) %>% dplyr::select(c(remSleepMinutes, deepSleepMinutes, awakeSleepMinutes))
+sleep_augment_OK <- augment_data(sleep_augment_OK, duplicates = augmenting_duplicates, perturb_sd = perturbation_standarddeviation) # Augment data (Poor-ish sleep)
+
+sleep_augment <- rbind(sleep_augment_VERYPOOR, sleep_augment_POORrem, sleep_augment_OK) # Combine augmented data
+
+sleep_augment <- sleep_augment %>% mutate(Date = NA) # Add 'Date' column with NA values to sleep_augment
+
+sleepquality_clustering <- rbind(sleepquality_clustering, sleep_augment) %>% # Combine datasets and add DataProcessing label
+  mutate(DataProcessing = ifelse(is.na(Date), "Augmented", "Non-imputed, Real"))
+
+# Separate datasets with and without awake
+x <- sleepquality_clustering %>%
+  dplyr::select(-c(Date, DataProcessing))
+x.scale <- scale(x)
+
+xselect <- sleepquality_clustering %>%
+  dplyr::select(-c(Date, awakeSleepMinutes, DataProcessing))
+xselect.scale <- scale(xselect)
+```
+As Figure `r num_figure+1` shows, `remSleepMinutes` has significantly fewer data count compared to `deepSleepMinutes`, which explains why I needed to augment the data: 
+```{r}
+# Calculate skewness and find highly skewed data
+#ordered_skewness <- round(abs(skewness(x)), 2) ;ordered_skewness <- sort(as.data.frame(t(ordered_skewness)), decreasing = TRUE) # There were none, except AwakeSleepMinutes
+hist_rem <- sleepquality_clustering %>% # Create histogram plots
+  gf_histogram( ~ remSleepMinutes, fill = ~DataProcessing)
+hist_deep <- sleepquality_clustering %>%
+  gf_histogram( ~ deepSleepMinutes, fill = ~DataProcessing)
+
+num_figure <- num_figure + 1  # Increment figure counter
+
+# Combine histograms into grid
+hist_grid <- hist_rem + hist_deep + plot_layout(nrow = 2) +
+  plot_annotation(title = paste0("Figure ", num_figure, ': Clustering Variables'))
+hist_grid # Display graph
+```
+
+Two possible explanations for the variation exist. First, the COVID-19 pandemic (2021-2022) amplified anxieties and multiplied `remSleepMinutes`. Second, my consistent healthy sleep habits, such as avoiding sleep deprivation and alcohol, could account for higher `remSleepMinutes`. It's important to note that this dataset is personalized, potentially leading to irregularities. Thus, to improve clustering, I augmented low `remSleepMinutes` data to represent "Poor" sleep quality better.
+
+### Clustering Data Augmentation
+Using an `augment_data` function, I generated variations of the original `sleep` dataset by perturbing single data points with normal distribution-derived alterations. This augmentation encompassed different sleep scenarios, such as "very poor sleep," "poor REM sleep," and a "poor-ish REM/Deep sleep." For example, the "very poor" data point was a 0 deepSleepMinutes and a 0 remSleepMinutes, a miserable all-nighter. With perturbed duplicates created for three poor REM situations, I inserted them back into a separate sleep clustering dataset (alongside an indicator to keep track of them) and then scaled them for non-hierarchical clustering.
+
+### Clustering Tuning
+Next, I performed a non-hierarchical clustering analysis determining the optimal cluster counts (`K`) ranging from 2 to 6. I iteratively applied the `kmeans` function, employing seven different initial splits within each cluster. I then compared clustering results for each and calculated matching proportions to assess similarity to decide which `K` made sense to consider.
+
+This unsupervised approach helped with learning what clusters consistently repeated among random trials, as you can see in Table `r num_table+1` below:
+```{r}
+set.seed(777)
+result_df <- data.frame(K = integer(), Initial_Split = integer(), Match_Proportion = double(), stringsAsFactors = FALSE)
+clustering_train <- xselect.scale
+n <- nrow(clustering_train)
+nclusters <- 2:6
+num_splits <- 7
+
+for (kk in nclusters) {
+  for (split in 1:num_splits) {
+    kmeans_resultA <- kmeans(clustering_train, centers = kk)$cluster
+    kmeans_resultB <- kmeans(clustering_train, centers = kk)$cluster
+    tablematch <- table(kmeans_resultA, kmeans_resultB)
+    match_proportion <- sum(apply(tablematch, 2, max)) / n
+    result_df <- result_df %>% add_row(K = kk, Initial_Split = split, Match_Proportion = match_proportion) # Store results in the dataframe
+  }
+}
+
+summary_df <- result_df %>% group_by(K) %>% summarize(Median_Match_Proportion = round(median(Match_Proportion), 3)) # Summarize the information by K and calculate the median Match_Proportion
+
+num_table <- num_table + 1 # Increment the num_table
+kable(summary_df, caption = paste0("Table ", num_table, ": K-means Cluster Match Proportions (median of 7 runs each K)")) # Display the summary table using kable
+```
+
+Table `r num_table` shows that 3 or 4 clusters are great selections with the data and the augment. However, I chose *4* clusters as it allows for a potential "poor" `SleepQuality` category (Figure `r num_figure+1`).
+
+### Clustering and Classifying `SleepQuality`
+Therefore, I employed k-means clustering on the scaled sleep quality data using *4* clusters. I ran extra initial iterations (i.e., 10,000 additional runs) to increase the odds of optimizing clusters globally.  
+```{r}
+set.seed(7) # reproducible seed
+extraruns=10000 # extra runs for global optimum
+nclusters<-4 # 4	0.946 ~ 95% match
+kmeans_result <- kmeans(x=xselect.scale, centers=nclusters, nstart=extraruns) # k-means clustering
+
+sleepquality_clustering_post <- cbind(sleepquality_clustering, cluster=kmeans_result$cluster) # Add cluster info
+
+cluster_colors <- c("1"=brewer.pal(12, "Set3")[1], "2"=brewer.pal(12, "Set3")[3], "3"=brewer.pal(12, "Set3")[4], "4"=brewer.pal(12, "Set3")[6]) # Define colors
+
+Figure3_p1 <- sleepquality_clustering_post %>%
+  gf_point(remSleepMinutes ~ deepSleepMinutes, color = ~as.factor(cluster),shape = ~DataProcessing) + scale_shape_manual(values = c(1,16)) + scale_color_manual(values = cluster_colors) + labs(color = "Cluster") + theme_minimal() # Scatter plot
+
+# Save cluster centers and add Cluster
+cluster_centers <- as.data.frame(kmeans_result$centers) %>%
+  tibble::rownames_to_column("cluster")
+
+# Calculate sum of components
+sum_components <- rowSums(cluster_centers[, -1])
+
+# Map clusters to SleepQuality
+cluster_centers <- cluster_centers %>%
+  mutate(cluster = as.integer(cluster), SleepQuality = factor(case_when(cluster == which.min(sum_components) ~ "Poor", cluster == which.max(sum_components) ~ "Great", TRUE ~ "OK"), levels = c("Poor", "OK", "Great"), ordered = TRUE)) # Classify SleepQuality
+
+sleepquality_classified <- left_join(sleepquality_clustering_post, select(cluster_centers, cluster, SleepQuality), by = "cluster") # Join SleepQuality
+
+cluster_colors2 <- c("Poor"=brewer.pal(12, "Set3")[4], "OK"=brewer.pal(12, "Set3")[1], "Great"=brewer.pal(12, "Set3")[3]) # Define colors
+
+Figure3_p2 <- sleepquality_classified %>%
+  gf_point(remSleepMinutes ~ deepSleepMinutes,color = ~ SleepQuality,shape = ~ DataProcessing) + scale_shape_manual(values = c(1, 16)) + scale_color_manual(values = cluster_colors2) + theme_minimal() + guides(shape = "none") # SleepQuality plot (guides quiets the second plot's DataProcessing which crowds the right)
+```
+Figure `r num_figure+1` visually shows: (1) four colored clusters that *make sense* - for instance, having low `remSleepMinutes` but high `deepSleepMinutes` (or vice versa) is just "OK" `SleepQuality`; (2) and two shapes differentiating virtual and actual data- notably, clearly showing the low `remSleepMinutes` augmented:
+
+```{r, dpi=1000}
+num_figure <- num_figure + 1
+Figure3_p1 / Figure3_p2 +  plot_annotation(title = paste0("Figure ", num_figure, ': Sleep Quality Clustering and Classifying'))
+```
+
+Figure `r num_figure` also shows how I classified `SleepQuality`. First, I used the cluster centers and summed the components for each cluster. By strategically positioning the lower-left (i.e., low REM and Deep sleep) as "Poor" and the upper-right (i.e., high REM and Deep sleep) as "Great" on the scatter plot, I could classify the rest of the clusters as "OK" `SleepQuality`.
+
+## Further Data ETL and Missingness
+
+Ultimately, I finished the last touches of preparing the core sleep dataset. Please see in Figure `r num_figure+1` the tidied dataset, `ZZZ`, with its moderate missingness:
+
+```{r}
+#####  SleepQuality response classification variable (and processing)
+sleep_classed <- sleep %>% # Join SleepQuality
+  left_join(
+    sleepquality_classified %>% filter(!is.na(Date)) %>% dplyr::select(c(Date, SleepQuality)),
+    by = "Date"
+  ) %>% # Exclude sleep quality-related variables
+  dplyr::select(-c(sleepStart_Hours, sleepEnd_Hours, BedEnd_Hours, deepSleepMinutes, lightSleepMinutes, remSleepMinutes, awakeSleepMinutes)) %>%
+  rename(
+    BedStart_Hours_Lead1Day = BedStart_Hours,
+    Missing_sleepquality_Lead1Day = Missing_sleepquality,
+    SleepQuality_Lead1Day = SleepQuality
+  ) %>%   # Shift columns using lag function
+  mutate(
+    BedStart_Hours = lag(BedStart_Hours_Lead1Day),
+    Missing_sleepquality = lag(Missing_sleepquality_Lead1Day),
+    SleepQuality = lag(SleepQuality_Lead1Day)
+  ) %>%  # Remove unnecessary columns
+  dplyr::select(-c(BedStart_Hours_Lead1Day, Missing_sleepquality_Lead1Day, SleepQuality_Lead1Day)) %>%  # Fill in NA values from lag
+  fill(Missing_sleepquality, .direction = "up")
+
+sleep_classed <- left_join(sleep_classed, agg, by = "Date") # min and max HR, weightMA14, and bodyfatpercentMA14
+
+sleep_subset <-   sleep_classed %>% # just SleepQuality
+  dplyr::select(c(Date, SleepQuality)) %>%
+  filter(!is.na(SleepQuality))  # where not null
+
+food <- inner_join(food, sleep_subset, by = "Date") ### Join transaction tables
+
+# Creating Possible Food Allergens 
+
+# Define gluten and dairy keywords
+gluten_keywords <- c("Multigrain" ,"Cereal","burger","Bagel", "Dumpling", "Gnocchi", "Pancakes", "Pretzel", "Cornbread", "Corn Dog", "Pasta", "Pizza", "Wheat","Whole Grain","Bread", "Sandwich","Brownie",'Cookies',"Lox")
+dairy_keywords <- c("Cheese", "Cream Cheese", "Milk", "Butter", "Ice Cream", "Yogurt","Chobani", "Sour Cream", "Gelato", "Feta", "Cheddar", "Parmesan", "Ricotta", "Cream", "Cottage Cheese","Cake","Chocolate","Brownie","Paneer","Lassi","Cookies","Fairlife","Eggnog","Caramel")
+gluten_blacklist <- c("Gluten Free","GF", "Cauliflower Gnocchi", "Pasta, Chickpea")
+dairy_blacklist <- c("Peanut Butter","Almond Butter","Corn Cake","Oat Milk")
+
+food <- food %>%
+  mutate(
+    # pattern match for keywords
+    HasGluten = grepl(paste(gluten_keywords, collapse = "|"), Name, ignore.case = TRUE) &
+      !grepl(paste(gluten_blacklist, collapse = "|"), Name, ignore.case = TRUE),
+    HasDairy = grepl(paste(dairy_keywords, collapse = "|"), Name, ignore.case = TRUE) &
+      !grepl(paste(dairy_blacklist, collapse = "|"), Name, ignore.case = TRUE)
+  )
+
+
+# aggregate transactional tables
+food_agg <- food %>%
+  group_by(Date) %>%
+  summarise(
+    BreakfastCalories = sum(Calories[Meal == "Breakfast"]),
+    LunchCalories = sum(Calories[Meal == "Lunch"]),
+    DinnerCalories = sum(Calories[Meal == "Dinner"]),
+    TotalCalories = sum(Calories),
+    DinnerToTotal = DinnerCalories / TotalCalories,
+    GlutenCalories = sum(Calories[HasGluten]),
+    DairyCalories = sum(Calories[HasDairy]),
+    GlutenMeals = sum(HasGluten),
+    DairyMeals = sum(HasDairy)
+  )
+exercise_agg <- exercise %>%
+  group_by(Date) %>%
+  summarise(exerciseMinutes = sum(Total_Minutes))
+```
+
+```{r}
+# join onto main table
+ZZZ_raw <- left_join(sleep_classed, food_agg, by = "Date") %>%
+  mutate(SleepQuality_Yesterday = lag(SleepQuality),
+         isWeekEnd = weekdays(Date) %in% c("Saturday", "Sunday"),
+         DayOfWeek = weekdays(Date))
+
+ZZZ_raw <- left_join(ZZZ_raw,exercise_agg, by="Date") %>%
+  fill(TimeZone, SourceName, .direction = "down")  ### apply imputing down last occurence carried forward with TimeZone (it is usually Chicago time but when I visit family it is New York Time), assume SourceName is consistent for a little
+ZZZ <- ZZZ_raw %>%  # filter out missing sleep quality
+  filter(!Missing_sleepquality) %>% dplyr::select(-c(Missing_sleepquality, Date, Type)) 
+
+ZZZ_alternative <- ZZZ %>%
+  mutate(across(where(is.character), factor)) %>%
+  mutate(SleepQuality = factor(
+    ifelse(SleepQuality %in% c("Poor", "OK"), "NotGreat", "Great"),
+    levels = c("NotGreat", "Great")
+  ))
+
+Figure_Question <- plot_missing_data_heatmap(ZZZ)
+
+num_figure <- num_figure + 1
+
+# Combine histograms into grid
+Figure_Question <-
+  Figure_Question + plot_annotation(
+    title = paste0("Figure ",num_figure,': Missingness of Sleep Data (where SleepQuality is known)'))
+
+# display graph
+Figure_Question
+
+```
+
+# Machine Learning Model Fitting
+## Model Fitting
+Missing values are the bane of most machine learning and often require discarding or replacement. Yet, the methods I pre-selected, Decision Trees (e.g., "rpart") and Boosting (e.g., xgbTree), resourcefully use NAs: NAs are usable if an observation has the following:  
+
+1. a **dependent variable** and 
+2. **at least one** non-NA independent variable
+
+As such, and because Decision Trees prune variables, I will use just one model: 
+
+`Model`: `SleepQuality` ~ .
+
+But, because one `SleepQuality` class, "Poor", has just 12 out of 330 rows, I decided to consider a two-class version: "Great" or "NotGreat". Therefore, I will vary the response label like so: 
+
+1. a three-class response: "Great", "OK", or "Poor".
+2. a two-class response: "Great" or "NotGreat".
+```{r}
+############# Model/Method specifications #############
+Model = as.formula(`SleepQuality` ~ .)
+```
+## Cross-Validations, 5-fold, Single and Double
+
+As the dataset contains only 330 rows of non-NA `SleepQuality` and missing information, this affects the hyperparameter tuning for optimal model performance. Likewise, one of the datasets had a low amount of classes ("Poor" with 12 of 330), so I needed to use "Kappa" for optimization, a classification metric that measures agreement while accounting for chance. Similarly, I needed stratified 5-fold groups in my single cross-validation because of the severe class imbalance. By experimenting, I changed the range of values for specific parameters to balance computation time and maximize Kappa.
+
+For the method "rpart," I tuned the following:
+
+- `cp` (complexity parameter) - between 0.001 and 0.1 (increments of 0.003). I found that increments of 0.001 wasted computational time as it repeated Kappa multiple times; thus, I settled with 0.003. 
+
+For the method "xgbTree," I tuned the following:
+
+- `gamma`, `min_child_weight`, and `subsample` are constant 0, 1, 0.45, respectively. These three parameters were mostly the same for my problem, and I did not need to optimize.
+- `max_depth`, or the maximum depth of the tree, I found the answer every time was 1. As the dataset was small, and the computation time was about 17 seconds per run at 1, I wanted to keep it simple and rely more on the `nrounds` for complexity tuning.
+- `nrounds`, or the number of boosting trees; I varied this one in fine increments of 1 from 5 to 20.
+- `eta`, or the learning rate for the gradient boosting algorithm, can be the difference between finding a local optimum or a global optimum, so I also varied it from 0.1 to 0.3 by 0.01.
+- `colsample_bytree`, or the proportions of the features used in `nrounds`, I varied by either 0.5 or 0.8 as this affected optimization.
+
+```{r}
+start_time <- Sys.time() # Record the start time
+
+# Config for storing results
+results_df_template <- # Create an empty dataframe
+  data.frame(
+    Parameter = character(),
+    Value = numeric(),
+    Kappa = numeric(),
+    methodApplied = character(),
+    modelApplied = factor(),
+    OuterLoop = numeric(),
+    RunNumber = numeric(),
+    stringsAsFactors = FALSE
+  ) # Create empty dataframe templates for results
+results_df0 <- results_df_template 
+
+Classification_Labels <-
+  list(ZZZ$SleepQuality, 
+       ZZZ_alternative$SleepQuality) # Create dataframe list
+
+# tuneGrids (after hypertuning)
+tunegrid_rpart <-  # 3 multiple as 0.001 seemed to repeat for 3-4
+  expand.grid(cp = seq(0.001, .1, by = 0.003))
+
+tunegrid_xgbTree <- expand.grid(
+  nrounds = seq(5, 20, by = 1), # Number of boosting rounds
+  max_depth = 1,  # Maximum depth of a tree (small dataset, 1 tends best)
+  eta = seq(0.1, 0.3, by = 0.01),  # Learning rate (similar to lambda)
+  gamma = 0,  # Minimum loss reduction required partitioning on leaf node
+  colsample_bytree = c(0.5, 0.8),  # features prop. used in boost rounds
+  min_child_weight = 1,  # Minimum sum of instance weight needed in child
+  subsample = 0.45 # Bag fraction
+)
+
+data.out = ZZZ %>% select(-c(SleepQuality)) # remove label and differ it within
+
+
+for (rr in seq(1, 100, by = 1)) {
+  seed = rr
+  set.seed(seed)
+  #set.seed(777)
+  
+  # ############ Single Cross Validation 5-fold ############
+  
+  source("my_functions.R") # houses single_CV_rpart_VS_xgbTree function
+  
+  single_cv_results <-
+    single_CV_rpart_VS_xgbTree(
+      dataused = data.out,
+      modelApplied = Model,
+      tunegrid_rpart = tunegrid_rpart,
+      tunegrid_xgbTree = tunegrid_xgbTree,
+      ExcludeLabel = 1,
+      xgbTreeRuns = 0,
+      rpartRuns = 1
+    )
+  
+  results_df0 <- rbind(results_df0,
+                       single_cv_results$df)
+}
+
+end_time <- Sys.time() # Record the end time
+
+# TEMP!!!!!!!!!!!!!!!!!!!
+#round(end_time - start_time, 1)
+```
+
+```{r}
+# Double Cross-validation (Outer layer 5-fold)
+
+source("my_functions.R") # houses single_CV_rpart_VS_xgbTree function
+start_time <- Sys.time() # Record the start time
+
+single_cv_results <- list() # clear
+results_df <-
+  results_df_template # clear or initialize storing results
+
+
+############ Double Cross Validation 5-fold then single CV ############
+
+data.out = ZZZ %>% select(-c(SleepQuality)) # remove label and differ it within
+
+n.out = dim(data.out)[1]
+k.out = 5 # 5-fold
+groups.out = rep(1:k.out, #group labels list
+                 length = n.out)
+
+for (rr in seq(1,10,by=1)) {
+  seed = rr
+  set.seed(seed)
+
+  cvgroups.out = sample(groups.out,
+                        n.out)  #orders randomly
+
+  # set actuals and predicted storage
+  alltruth.out <- allpredictedCV.out <- rep(NA,
+                                            n.out)
+
+  for (jj in 1:k.out)  {
+    #be careful not to re-use loop indices
+    groupj.out = (cvgroups.out == jj)
+
+    # ############ Single Cross Validation 5-fold ############
+
+    # define the training set for outer loop
+    traindata.out = data.out[!groupj.out,] #used in the single CV function
+
+    #define the validation set for outer loop
+    validationdata.out = data.out[groupj.out, ]
+
+    single_cv_results <-
+      single_CV_rpart_VS_xgbTree(
+        dataused = traindata.out,
+        #training set for outer loop
+        modelApplied = Model,
+        tunegrid_rpart = tunegrid_rpart,
+        tunegrid_xgbTree = tunegrid_xgbTree,
+        OuterFold = jj,
+        ExcludeLabel = 1,
+        xgbTreeRuns = 0,
+        rpartRuns = 1
+      )
+    results_df <- rbind(results_df,
+                        single_cv_results$df)
+
+    # per outerloop's jj, we want to find the bestmodel
+    best_row <- results_df %>%
+      filter(OuterLoop == jj) %>%
+      arrange(desc(Kappa)) %>% # ascending order
+      dplyr::slice(1) # first row, even with ties
+
+    method_applied <- best_row$methodApplied
+    model_applied <- best_row$modelApplied
+
+    # accessing the best model of this outer loop
+    one_best_Model <- single_cv_results$bestModel
+
+    #based on best dataused, add to validation
+    if (best_row$modelApplied == "3-class") {
+      validationdata.out <- # need to add on SleepQuality 3-class
+        cbind(SleepQuality = Classification_Labels[[1]][groupj.out],
+              validationdata.out)
+    } else {
+      # "2-class"
+      validationdata.out <- # '''                         2-class
+        cbind(SleepQuality = Classification_Labels[[2]][groupj.out],
+              validationdata.out)
+    }
+
+    # predict
+    predictvalid <- predict(one_best_Model,
+                            newdata = validationdata.out,
+                            na.action = na.pass) # predicting required na.action too! ###@@##$
+
+    # actuals vs predicted
+    alltruth.out[groupj.out] <- # vital that it can change by labels
+      as.numeric(validationdata.out$SleepQuality)
+    allpredictedCV.out[groupj.out] <- predictvalid
+
+  } # end of outer loop
+
+  y = alltruth.out # needs to be apples to apples comparison
+  #print(y)
+
+  CV.valid = sum(y != allpredictedCV.out) / n.out
+
+  p.valid = 1 - CV.valid
+  print(paste0("Double CV: ", round(p.valid, 3), " (", seed, ")"))
+
+}
+# # TEMP
+# end_time <- Sys.time() # Record the end time
+# round(end_time - start_time, 1)
+
+```
+
+```{r}
+# Create storage
+DoubleCVResults <- tibble(
+  Name = factor(),
+  Parameters = factor(),
+  ProportionValid = numeric(),
+  RandomSeed = integer()
+)
+
+# Populate (manual, but better than rerunning for like 12 hours) # Note Decision Tree runs about 17 times faster so it has way more coverage than with boosting
+DoubleCVResults <- DoubleCVResults %>%
+  add_row(
+    Name = "2-class, DecisionTree",
+    Parameters = "ExcludeLabel = 1, xgbTreeRuns = 0, rpartRuns = 1",
+    ProportionValid = c(
+      0.676, 0.721, 0.752, 0.606, 0.7, 0.7, 0.667, 0.691, 0.667, 0.755,
+      0.648, 0.694, 0.673, 0.639, 0.648, 0.682, 0.688, 0.67, 0.63, 0.627,
+      0.655, 0.627, 0.6, 0.6, 0.636, 0.682, 0.636, 0.648, 0.664, 0.645,
+      0.673, 0.6, 0.655, 0.606, 0.682, 0.588, 0.648, 0.694, 0.627, 0.633,
+      0.658, 0.733, 0.688, 0.679, 0.642, 0.685, 0.67, 0.727, 0.7, 0.621,
+      0.618, 0.667, 0.661, 0.7, 0.618, 0.658, 0.706, 0.642, 0.633, 0.636,
+      0.673, 0.667, 0.612, 0.63, 0.712, 0.7, 0.658, 0.706, 0.703, 0.648,
+      0.597, 0.658, 0.648, 0.645, 0.664, 0.667, 0.652, 0.691, 0.7, 0.673,
+      0.585, 0.685, 0.682, 0.618, 0.603, 0.715, 0.606, 0.67, 0.594, 0.603
+    ),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "2-class, Boosting",
+    Parameters = "ExcludeLabel = 1, xgbTreeRuns = 3, rpartRuns = 0",
+    ProportionValid = c(0.621, 0.606, 0.609, 0.63, 0.642, 0.682),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "2-class, Boosting + Decision Tree",
+    Parameters = "ExcludeLabel = 1, xgbTreeRuns = 3, rpartRuns = 1",
+    ProportionValid = c(0.615, 0.655, 0.609, 0.655, 0.645, 0.621, 0.648),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "3-class, Decision Tree",
+    Parameters = "ExcludeLabel = 2, xgbTreeRuns = 0, rpartRuns = 1",
+    ProportionValid = c(0.661, 0.579, 0.579, 0.579, 0.63, 0.57, 0.6, 0.621, 0.67, 0.579, 0.558, 0.618, 0.606, 0.591, 0.579, 0.603, 0.579, 0.655, 0.655, 0.579, 0.579, 0.597, 0.579, 0.579, 0.609, 0.579, 0.597, 0.612, 0.585, 0.63, 0.612, 0.579, 0.618, 0.645, 0.579, 0.579, 0.603, 0.627, 0.642, 0.579, 0.615, 0.659, 0.673, 0.579, 0.655, 0.579, 0.591, 0.578, 0.588, 0.579, 0.67, 0.567, 0.568, 0.561, 0.642, 0.682, 0.645, 0.667, 0.579, 0.615, 0.691, 0.588, 0.6, 0.6, 0.682, 0.646, 0.622, 0.661, 0.6, 0.626, 0.59, 0.612, 0.666, 0.579, 0.648, 0.659, 0.57, 0.642, 0.617, 0.579, 0.592, 0.597, 0.579, 0.612, 0.667, 0.637, 0.676, 0.579, 0.606, 0.615, 0.584, 0.579, 0.585, 0.629, 0.602, 0.627, 0.589, 0.65, 0.613, 0.641, 0.6, 0.615, 0.617, 0.625, 0.612, 0.617, 0.579, 0.614, 0.643, 0.617, 0.595, 0.578, 0.578, 0.618, 0.625, 0.647, 0.604, 0.611, 0.601, 0.579, 0.641, 0.626, 0.621, 0.659, 0.619, 0.635, 0.577, 0.579, 0.59, 0.6, 0.618, 0.661, 0.587, 0.579, 0.579, 0.641, 0.623, 0.66, 0.629, 0.579, 0.625, 0.586, 0.612, 0.655, 0.666, 0.593, 0.629, 0.624, 0.58, 0.619, 0.592, 0.578, 0.579, 0.648, 0.601, 0.654, 0.631, 0.603, 0.615, 0.6, 0.659, 0.636, 0.579, 0.638, 0.593, 0.6, 0.584, 0.645, 0.615, 0.592, 0.659, 0.642, 0.601, 0.579, 0.579, 0.648, 0.647, 0.648, 0.591, 0.613, 0.618, 0.579, 0.609, 0.6, 0.638, 0.601, 0.579, 0.636, 0.647, 0.579, 0.579, 0.622, 0.579, 0.607, 0.645, 0.593, 0.607, 0.652, 0.613, 0.611, 0.579, 0.579, 0.649, 0.617, 0.579, 0.579, 0.647, 0.579, 0.58, 0.598, 0.579, 0.613, 0.619, 0.651, 0.579, 0.611, 0.593, 0.617, 0.585, 0.594, 0.579, 0.579, 0.595, 0.642, 0.641, 0.579, 0.579, 0.609, 0.615, 0.642, 0.584, 0.579, 0.633, 0.582, 0.646, 0.592, 0.627, 0.591, 0.603, 0.589, 0.579, 0.579, 0.592, 0.578, 0.623, 0.615, 0.579, 0.579, 0.603, 0.639, 0.579, 0.645, 0.579, 0.6, 0.579, 0.645
+    ),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "3-class, Boosting",
+    Parameters = "ExcludeLabel = 2, xgbTreeRuns = 3, rpartRuns = 0",
+    ProportionValid = c(0.633, 0.642, 0.6, 0.618, 0.627, 0.597, 0.615, 0.624),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "3-class, Boosting + Decision Tree",
+    Parameters = "ExcludeLabel = 2, xgbTreeRuns = 3, rpartRuns = 1",
+    ProportionValid = c(0.639, 0.609, 0.291, 0.43, 0.391, 0.315, 0.639, 0.645),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "2 or 3-class, Decision Tree",
+    Parameters = "ExcludeLabel = NULL, xgbTreeRuns = 0, rpartRuns = 1",
+    ProportionValid = c(0.612, 0.7, 0.464, 0.47, 0.4, 0.597, 0.552, 0.476, 0.579, 0.4, 0.497, 0.609, 0.524, 0.545, 0.609, 0.503, 0.467, 0.452, 0.385, 0.439, 0.585, 0.415, 0.476, 0.527, 0.509, 0.667, 0.464, 0.53, 0.552, 0.445, 0.436, 0.276, 0.603, 0.455, 0.488, 0.37, 0.448, 0.512, 0.588, 0.485, 0.648, 0.548, 0.436, 0.536, 0.433, 0.094, 0.536, 0.43, 0.579, 0.5, 0.585, 0.627, 0.57, 0.148, 0.539, 0.579, 0.455, 0.467, 0.564, 0.382, 0.43, 0.439, 0.327, 0.294, 0.591, 0.512, 0.615, 0.509, 0.576, 0.448, 0.467, 0.436, 0.461, 0.491, 0.548, 0.497, 0.321, 0.421, 0.564, 0.488, 0.388, 0.509, 0.433, 0.555, 0.582, 0.536, 0.661, 0.53, 0.633, 0.633, 0.624, 0.612, 0.421, 0.539, 0.497, 0.573, 0.188, 0.227, 0.482, 0.373, 0.445, 0.615, 0.573, 0.333, 0.297, 0.415, 0.485, 0.53, 0.536, 0.452, 0.318, 0.406, 0.494, 0.412, 0.594, 0.558, 0.527, 0.373, 0.348, 0.315, 0.6, 0.524, 0.485, 0.252, 0.445, 0.418),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "2 or 3-class, Boosting",
+    Parameters = "ExcludeLabel = NULL, xgbTreeRuns = 3, rpartRuns = 0",
+    ProportionValid = c(0.621, 0.606, 0.609, 0.63, 0.612, 0.555, 0.588),
+    RandomSeed = NULL
+  ) %>%
+  add_row(
+    Name = "2 or 3-class, Boosting + Decision Tree",
+    Parameters = "ExcludeLabel = NULL, xgbTreeRuns = 3, rpartRuns = 1",
+    ProportionValid = c(0.639, 0.609, 0.291, 0.43, 0.391, 0.315, 0.639, 0.645),
+    RandomSeed = NULL
+  )
+```
+```{r, dpi=600, message=FALSE}
+rationale <- DoubleCVResults %>%
+  gf_boxplot(
+    Name ~ ProportionValid,
+    alpha = 0.5,
+    position = "identity",
+    ylab = "",
+    title = "Double CV"
+  )  +
+  coord_cartesian(xlim = c(0.35, 0.78)) +  # Adjust the x-axis limits
+  geom_vline(xintercept = 0.5, color = "red") + # cutoff for better than random chance
+  geom_segment(
+    x = 0.8,
+    xend = 0.77,
+    y = 3, 
+    yend = 3,
+    arrow = arrow(type = "closed", length = unit(0.15, "inches")),
+    color = "red"
+  )
+  
+rationale2 <- results_df0 %>%
+  gf_point(Kappa ~ Value,
+           xlab = "cp",
+           ylab= "Kappa",
+           title = "Single CV") %>%
+  gf_smooth() +
+  geom_vline(xintercept = 0.01,
+             color = "red")   +
+  geom_text(aes(x = 0.05, y = -0.025),
+            label = "Best Kappa's \n at cp ~ 0.01",
+            color = "grey50")
+
+num_figure <- num_figure + 1
+
+# Combine the plots using patchwork
+combined_plot <- (rationale | rationale2) +
+  plot_layout(guides = "collect")  # Collect the legends
+
+# Manually adjust the title position using ggdraw
+final_plot <- plot_grid(combined_plot) +
+  draw_label(
+    paste0(
+      "Figure ",
+      num_figure,
+      ': \n Best Model Selection'
+    ),
+    x = 0.17, y = 0.94,  # Adjust y position to prevent overlap
+    hjust = 0.5,
+    #fontface = "none",
+    size = 14
+  )
+```
+
+## Best Model
+
+```{r,dpi=600}
+final_plot
+```
+
+I selected the best model and tuning parameters using results from double cross-validation and single cross-validations, visualized in Figure `r num_figure`:
+
+1. *Left*: The Decision Tree method "rpart" performed better than "xgbTree" with less overfitting, leading to a surprising yet favorable choice due to its interpretability.
+2. *Left*: The 2-class label tends to be less variable than the 3-class for the response variable, favoring a 2-class Decision Tree model.
+3. *Right*: Thus, after 100 random single cross-validations on the 2-class Decision Tree model, the higher Kappa values are around a cp of 0.1, guiding the best model selection and hyperparameter.
+
+```{r}
+set.seed(777)
+data.out = ZZZ %>% select(-c(SleepQuality)) # remove label
+
+data.out_best <- cbind(SleepQuality = Classification_Labels[[2]],
+                       data.out)
+
+cp_best <- 0.01 # Define your hyperparameters
+
+training_best <- trainControl(method = 'none')
+
+bestmodel <-
+  prune(rpart(SleepQuality ~ .,
+              data = data.out_best,
+              na.action = na.pass),
+        cp = cp_best)
+```
+
+We have our best model after fitting a Decision Tree model to the full dataset, and pruning the tree with a cp at 0.1.  
+
+# Interpretting Best Model
+## Visualizing Best Model
+
+Decision Trees have a reputation as one of the most interpretable machine learning; Figure `r num_figure+1` shows why:
+
+```{r, fig.width=6, fig.height=6, dpi=3500}
+# Customize appearance
+my_node_style <- list(type = 5, fallen.leaves = FALSE)
+
+num_figure <- num_figure +1
+# Plot the decision tree
+rpart.plot(bestmodel, 
+           cex=NULL,
+           box.palette = c("Greens"),
+           main = paste0("Figure ",num_figure,": Decision Tree for John's `SleepQuality` Prediction"), 
+           fallen.leaves = my_node_style$fallen.leaves,
+           type = my_node_style$type,
+           extra = "auto"
+           )  
+```
+
+Figure `r num_figure` shows a few insights for me:
+
+- My `maxHeartRate` is the most crucial variable for `SleepQuality`, especially at the **152 BPM** threshold; I better exercise more intensely!
+- `BedStart_Hours` -0.64 translates to a threshold of 11:21 PM. This *makes sense* because the later I enter the bed with my phone, the less sleep duration I get due to my regular biological or occupational wakeups around 7-10 AM.
+- `TotalCalories` and `LunchCalories` indicate that if my `Weight_MA14` exceeds 156, I should have "Great" sleep. So this makes sense because if I am underweight and likely eating a massive dinner (or breakfast), my gastrointestinal system may wreck my SleepQuality.
+- An uncontrollable variable is included: `DayOfWeek`. It reflects my weekly patterns (e.g., hot yoga Fridays with my wife, weekday working).
+
+## Variable Importance
+
+Figure `r num_figure+1` shows the variable importances from the best model of the Decision Tree:
+
+```{r}
+# Variable importance
+var_importance <- bestmodel$variable.importance
+
+# Create a data frame with variable names
+var_importance_df <- data.frame(Variable = names(var_importance),
+                                Importance = var_importance) %>%
+  arrange(desc(Importance)) %>% # sort
+  mutate(Variable = factor(Variable,levels = Variable)) # reorder
+
+# Create a color vector for highlighting
+color_vector <- rep("grey", nrow(var_importance_df))
+color_vector[1:2] <- "red"
+
+# Generate column plot
+var_imp_plot <- var_importance_df %>%
+  gf_col(Importance ~ Variable,
+         fill = color_vector,
+         xlab="") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# partialPlots
+var_partialPlot1 <- gf_partialPlot(
+  model = bestmodel,
+  modelType = "classification", 
+  na.action = "na.pass",
+  df = data.out_best,
+  x.var = "maxHeartRate",
+  which.class = "Great"
+)
+var_partialPlot2 <- gf_partialPlot(
+  model = bestmodel,
+  modelType = "classification", 
+  na.action = "na.pass",
+  df = data.out_best,
+  x.var = "Weight_MA14",
+  which.class = "Great"
+)
+
+num_figure <- num_figure + 1
+
+var_imp_plot / (var_partialPlot1 | var_partialPlot2) +
+  plot_annotation(title = paste0(
+    "Figure ",
+    num_figure,
+    ': Best Model (Decision Tree) Variable Importance'
+  ))
+
+```
+
+### Relationship of Predictors with Response
+In Figure `r num_figure`, the partial dependence plot shows: 
+
+1. *Left*: Shows how higher maximum heart rates correspond to an increased likelihood of "Great" sleep quality. This suggests intense exercise may promote better sleep due to enhanced melatonin production.
+2. *Right*: Highlights a connection between rolling average body weight (Weight_MA14) and the "Great" sleep quality probability. Around 155 lbs mark a significant threshold, linked to a month of weight loss and lower sleep quality.
+
+
+## Model Accuracy and Prediction Use
+Given a binary class scenario, random chance predictions would yield around 57% accuracy by guessing the majority class ("NotGreat"). Our model, however, achieves approximately 65% accuracy, demonstrating its improved predictive power.
+
+Although our best model struggles to classify "Great" `SleepQuality` according to the ROC curve in the Appendix, there's room for enhancement. Incorporating more diverse data and considering less disruptive periods than the COVID-19 pandemic could reduce misclassification and enhance prediction accuracy.
+
+
+
+# Appendix
+## Association rules
+
+```{r, message=FALSE}
+### Association Rules
+food_subset <- food %>% 
+  dplyr::select(-c(Quantity,Units, Name, Date))
+
+# Convert columns to numeric
+food_subset <- food_subset %>%
+  mutate(across(c(`Fat (g)`, `Protein (g)`, `Carbohydrates (g)`, Calories), as.numeric))
+
+# Define fixed boundary breaks
+fat_breaks <- round(quantile(food_subset$`Fat (g)`, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), digits = 0)
+protein_breaks <- round(quantile(food_subset$`Protein (g)`, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), digits = 0)
+carb_breaks <- round(quantile(food_subset$`Carbohydrates (g)`, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), digits = 0)
+calories_breaks <- round(quantile(food_subset$Calories, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), digits = 0)
+
+# Discretize columns
+food_subset <- food_subset %>%
+  mutate(`Fat (g)` = discretize(`Fat (g)`, method = "fixed", breaks = fat_breaks, ordered = TRUE),
+         `Protein (g)` = discretize(`Protein (g)`, method = "fixed", breaks = protein_breaks, ordered = TRUE),
+         `Carbohydrates (g)` = discretize(`Carbohydrates (g)`, method = "fixed", breaks = carb_breaks, ordered = TRUE),
+         Calories = discretize(Calories, method = "fixed", breaks = calories_breaks, ordered = TRUE)) %>%
+  mutate(across(where( ~ !is.ordered(.)),factor)) # factorize everything that isn't already an ordered factor
+
+food_subset_justcalories <- food_subset %>% 
+  dplyr::select(-c(`Fat (g)`,`Protein (g)`,`Carbohydrates (g)`))
+
+# Convert to transactions (see how NAs are handled) # They actually handled really well
+food_subset_txn <- as(food_subset,"transactions") 
+food_subset_justcalories_txn <- as(food_subset_justcalories,"transactions")
+
+# Find association rules with SleepQuality in consequent
+rules <- apriori(
+  data = food_subset_justcalories_txn, # swap out as desired
+  parameter = list(
+    supp = 0.005,  # Minimum support threshold
+    conf = 0.7    # Minimum confidence threshold
+))
+
+rules_with_SleepQuality <- subset(rules, subset = rhs %in% c("SleepQuality=Great","SleepQuality=Poor"))
+
+non_redundant = (interestMeasure(rules_with_SleepQuality,
+                                 measure = "improvement",
+                                 quality_measure =  "confidence") > 0) # redundant pruning
+rules_with_SleepQuality_non_redundant = rules_with_SleepQuality[non_redundant]
+```
+
+```{r, fig.width=6,dpi=1000, message=FALSE}
+
+top_n_rules <- (head(rules_with_SleepQuality_non_redundant, n = 5, by = "lift"))
+
+#plot(rules_with_SleepQuality_non_redundant, method = "grouped") +
+  #coord_flip()
+
+top_n_rules_df <- as(top_n_rules, "data.frame") %>% mutate(across(where(is.numeric), ~ round(., 4))) # round to 4th place
+rownames(top_n_rules_df) <- NULL # remove named rows (rule #)
+num_table <- num_table + 1
+kable(
+  top_n_rules_df,
+  caption = paste0(
+    "Table ",
+    num_table,
+    ": Top 5 Association Rules (supp = 0.005,conf = 0.7)"
+  )
+)
+
+```
+While the above table makes sense, a morning glass of milk gives me enough energy as a breakfast that is quick, easy, and helps the day; I have been avoiding dairy for more than a year due to a tested dairy allergen, which is surprising. I also was surprised to find out that a large curry meal with dairy (e.g., Palaak Paneer) may help my sleep.
+
+## ROC Curve
+
+```{r, message=FALSE}
+library(pROC)
+predicted_probs <- predict(bestmodel)[,"Great"]
+actual_classes <- ifelse(data.out_best$SleepQuality == "Great", 1, 0)
+
+
+roc_obj <- roc(actual_classes, 
+               predicted_probs)
+
+plot(roc_obj, 
+     main = "Best Model's ROC Curve",
+     print.auc = TRUE,
+     auc.polygon = TRUE,
+     auc.polygon.col = "skyblue",
+     grid = TRUE,
+     #grid.col = "lightgray",
+     max.auc.polygon = TRUE,
+     auc.polygon.transparency = 0.3,
+     lwd = 2,
+     #cex.lab = 1.2,
+     #cex.axis = 1.2,
+     #cex.main = 1.5,
+     ylim = c(0, 1)
+     )  # Set y-axis limits)
+
+# Add labels and a legend
+labels(roc_obj, 
+       font.main = 1, 
+       cex = 0.8, 
+       col = "black", 
+       percent = TRUE)
+```
+
+# References
+Page 18, Section 5: Missing Data
+An Introduction to Recursive Partitioning
+Using the RPART Routines
+Terry M. Therneau
+Elizabeth J. Atkinson
+Mayo Foundation
+October 21, 2022
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4486966/
+
+https://www.kaggle.com/code/pelkoja/visual-xgboost-tuning-with-caret
